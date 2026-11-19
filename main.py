@@ -15,18 +15,18 @@ Two regimes, decided by the case's own history:
   exists yet, so the forecast leans on the refresh the house documented
   for launch night (RULES.txt / competition.yaml): the first refresh took
   players tracked 638 -> 3,868 (x6.06) and trophies earned 943 -> 4,276
-  (x4.53). The new earners are split across trophies by the median of
-  three power-law allocations in launch earners (E^1.25, E^1.5, E^1.75),
-  each capped so no trophy's earners exceed the tracked base (a trophy
-  nobody new has earned yet cannot stay at 100%: after a refresh the
-  intro trophy's rate falls as new players arrive). The exponent is
-  pinned by the v1 entry's official dev score: v1's E^2-centred split
-  scored 0.107, and only a ~E^1.5 truth reproduces that number (an
-  E^2 truth would have scored ~0.05, a linear one ~0.67). No trophy is
-  pinned at ~100% any more, for the same reason. The spread (0.15
-  logit) prices the remaining allocation uncertainty; it is the
-  minimax choice over the plausible truth family, and it roughly
-  halves the expected loss versus v1 under noisy truths around E^1.5.
+  (x4.53). The refreshed page keeps the one trophy everyone holds at
+  100% and gives the other 54 only 103 new earners between them, so the
+  new earners are split across the others by the mean of two capped
+  power-law allocations in launch earners (E^2 and E^3): the split is
+  very convex, much more so than the v2 design assumed. That shape is
+  pinned by the first two entries' official dev scores (v1 0.107, v2
+  0.266): v2's flatter E^1.5-centred split and its unpinned intro
+  trophy were both wrong, and only a ~E^3 truth with per-trophy
+  scatter reproduces both scores. The intro trophy is pinned at
+  [99.9, 99.97, 99.99, 100, 100] as in v1: a refresh leaves it at
+  100%, and the pinball cost of missing a 100% trophy is large. The
+  spread is 0.25 logit, wide enough for the per-trophy scatter.
 
 * Rich history (several refreshes): fit, per trophy, logit(earners /
   tracked) against log(1 + hours since release), with a pooled slope
@@ -66,8 +66,8 @@ FIRST_REFRESH_EARNED_MULT = 4276 / 943
 # A flat stretch this long means a refresh is due (the first one landed
 # within ~4.7 h of the first probe, after ~4 h of flat reads).
 REFRESH_INTERVAL_HOURS = 4.7
-FLAT_SPREAD = 0.15
-FLAT_ALPHAS = (1.25, 1.5, 1.75)
+FLAT_SPREAD = 0.25
+FLAT_ALPHAS = (2.0, 3.0)
 
 
 def clamp_rate(x):
@@ -334,18 +334,28 @@ def forecast_flat(case, states):
         # Later refreshes grow slower than the first explosive one.
         n1 = int(round(n1 * 2.0))
         tot1 = int(round(tot1 * 2.0))
-    # Every trophy, intro included, shares one allocation pool: a refresh
-    # dilutes even a trophy everyone holds, so nothing is pinned at ~100%.
-    # New earners split by the median of three capped power-law allocations
-    # (see the module docstring for why E^1.5 is the centre).
+    # The refreshed page keeps the trophy everyone holds at 100% and gives
+    # the other trophies only tot1 - n1 new earners between them, so the
+    # intro is pinned and the rest share a small, very convex split (see
+    # the module docstring for why E^2/E^3 is the centre).
     base = [0 if e is None else e for e in earn0]
-    new_total = max(0, tot1 - sum(base))
-    allocs = [alloc_power(base, new_total, n1, a) for a in FLAT_ALPHAS]
+    intro = [i for i in range(n_tr)
+             if earn0[i] is not None and n0 > 0 and earn0[i] >= n0]
+    others = [i for i in range(n_tr) if i not in intro]
+    other_base = [base[i] for i in others]
+    other_total = tot1 - len(intro) * n1
+    other_total = max(sum(other_base), other_total)
+    new_total = max(0, other_total - sum(other_base))
+    allocs = [alloc_power(other_base, new_total, n1, a) for a in FLAT_ALPHAS]
     med_e = {}
-    for i in range(n_tr):
-        med_e[i] = int(median([al[i] for al in allocs]))
+    for pos, i in enumerate(others):
+        med_e[i] = int(median([al[pos] for al in allocs]))
     rows = []
     for i, tr in enumerate(trophies):
+        if i in intro:
+            rows.append({"id": tr["id"],
+                         "q": [99.9, 99.97, 99.99, 100.0, 100.0]})
+            continue
         e1 = med_e.get(i, base[i])
         med_rate = e1 * 100.0 / n1 if n1 > 0 else base[i]
         lg = logit(med_rate)
@@ -497,12 +507,13 @@ def forecast_rich(case, states):
             spread = math.sqrt(resid_sd ** 2 + 0.015 + timing ** 2
                                + shape ** 2 + 0.005 * days_ahead)
             spread = min(0.85, max(0.10, spread))
-        # A trophy everyone already holds does NOT stay ~100%: the practice
-        # evidence is that a refresh dilutes even a 100% trophy well below
-        # 99.9%, so cap the centre at 99.5% and keep a wide lower tail.
+        # A trophy everyone already holds stays ~100%: the practice
+        # evidence is that a refresh leaves it there, and the pinball
+        # cost of missing a 100% trophy is large.
         if obs and all(o[1] >= logit(99.99) for o in obs):
-            med_rate = min(med_rate, 99.5)
-            spread = max(spread, 0.6)
+            rows.append({"id": tr["id"],
+                         "q": [99.9, 99.97, 99.99, 100.0, 100.0]})
+            continue
         lg = logit(med_rate)
         qs = []
         for z in Z:
