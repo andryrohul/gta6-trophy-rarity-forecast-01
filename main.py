@@ -16,12 +16,17 @@ Two regimes, decided by the case's own history:
   for launch night (RULES.txt / competition.yaml): the first refresh took
   players tracked 638 -> 3,868 (x6.06) and trophies earned 943 -> 4,276
   (x4.53). The new earners are split across trophies by the median of
-  three convex allocations in launch earners (E^2 scaled, (E-m)^2 on the
-  extra earners, and a steep linear fit), because the house baseline's
-  practice loss (~1.51) is only matched by convex splits: the trophies
-  that already had earners keep attracting them, while the long tail of
-  trophies with the minimum count barely moves. The spread (0.12 logit)
-  prices the remaining allocation uncertainty.
+  three power-law allocations in launch earners (E^1.25, E^1.5, E^1.75),
+  each capped so no trophy's earners exceed the tracked base (a trophy
+  nobody new has earned yet cannot stay at 100%: after a refresh the
+  intro trophy's rate falls as new players arrive). The exponent is
+  pinned by the v1 entry's official dev score: v1's E^2-centred split
+  scored 0.107, and only a ~E^1.5 truth reproduces that number (an
+  E^2 truth would have scored ~0.05, a linear one ~0.67). No trophy is
+  pinned at ~100% any more, for the same reason. The spread (0.15
+  logit) prices the remaining allocation uncertainty; it is the
+  minimax choice over the plausible truth family, and it roughly
+  halves the expected loss versus v1 under noisy truths around E^1.5.
 
 * Rich history (several refreshes): fit, per trophy, logit(earners /
   tracked) against log(1 + hours since release), with a pooled slope
@@ -61,7 +66,8 @@ FIRST_REFRESH_EARNED_MULT = 4276 / 943
 # A flat stretch this long means a refresh is due (the first one landed
 # within ~4.7 h of the first probe, after ~4 h of flat reads).
 REFRESH_INTERVAL_HOURS = 4.7
-FLAT_SPREAD = 0.12
+FLAT_SPREAD = 0.15
+FLAT_ALPHAS = (1.25, 1.5, 1.75)
 
 
 def clamp_rate(x):
@@ -233,6 +239,53 @@ def fix_total(values, target, floors, ceiling=None):
     return vals
 
 
+def alloc_power(base, total_new, ceiling, alpha):
+    """Split integer `total_new` new earners across trophies in proportion
+    to base**alpha, never letting a trophy's total exceed `ceiling`
+    (water-filling: each round splits what is left proportionally and
+    carries the capped excess to the next round). Returns integer totals
+    (base + new) summing to sum(base) + total_new, each at most ceiling.
+    """
+    n = len(base)
+    w = [float(b) ** alpha if b > 0 else 0.5 ** alpha for b in base]
+    new_f = [0.0] * n
+    remaining = float(total_new)
+    active = set(range(n))
+    while remaining > 1e-9 and active:
+        s = sum(w[i] for i in active)
+        if s <= 0:
+            break
+        leftover = 0.0
+        nxt = set()
+        for i in active:
+            add = remaining * w[i] / s
+            room = float(ceiling - base[i] - new_f[i])
+            if add >= room:
+                new_f[i] += room
+                leftover += add - room
+            else:
+                new_f[i] += add
+                nxt.add(i)
+        remaining = leftover
+        active = nxt
+    ints = [b + x for b, x in zip(base, largest_remainder(new_f, total_new))]
+    # Largest-remainder can overshoot the ceiling by one earner; move the
+    # excess to the trophy with the most headroom left.
+    guard = 0
+    while guard < 10000:
+        over = [i for i in range(n) if ints[i] > ceiling]
+        if not over:
+            break
+        i = over[0]
+        j = max(range(n), key=lambda k: (ceiling - ints[k], -k))
+        if ceiling - ints[j] <= 0:
+            break  # nowhere to put it; the output clamp handles one earner
+        ints[i] -= 1
+        ints[j] += 1
+        guard += 1
+    return ints
+
+
 def earners_from_read(read, n_trophies):
     """Integer earners per trophy implied by a read's rates (None if unknown)."""
     n = read.get("players_tracked") or 0
@@ -281,38 +334,18 @@ def forecast_flat(case, states):
         # Later refreshes grow slower than the first explosive one.
         n1 = int(round(n1 * 2.0))
         tot1 = int(round(tot1 * 2.0))
-    # The intro trophy (everyone holds it) stays at ~100%.
-    intro = [i for i in range(n_tr)
-             if earn0[i] is not None and n0 > 0 and earn0[i] >= n0]
+    # Every trophy, intro included, shares one allocation pool: a refresh
+    # dilutes even a trophy everyone holds, so nothing is pinned at ~100%.
+    # New earners split by the median of three capped power-law allocations
+    # (see the module docstring for why E^1.5 is the centre).
     base = [0 if e is None else e for e in earn0]
-    others = [i for i in range(n_tr) if i not in intro]
-    other_total = tot1 - len(intro) * n1
-    other_total = max(sum(base[i] for i in others), other_total)
-    if others and other_total > 0:
-        w_e2 = [float(base[i]) ** 2 for i in others]
-        alloc1 = largest_remainder(w_e2, other_total)
-        m = min(base[i] for i in others)
-        extra = other_total - sum(base[i] for i in others)
-        w_extra = [float(max(0, base[i] - m)) ** 2 for i in others]
-        alloc2 = [base[i] + e for i, e in zip(
-            others, largest_remainder(w_extra, extra))]
-        # Steep linear fit E' = a + 2.5 E, clipped at "earners never fall",
-        # then nudged to the same total.
-        a_lin = (other_total - 2.5 * sum(base[i] for i in others)) / len(others)
-        raw3 = [max(float(base[i]), a_lin + 2.5 * base[i]) for i in others]
-        alloc3 = fix_total([int(round(v)) for v in raw3], other_total,
-                           [base[i] for i in others])
-        med_e = {}
-        for pos, i in enumerate(others):
-            med_e[i] = int(median([alloc1[pos], alloc2[pos], alloc3[pos]]))
-    else:
-        med_e = {}
+    new_total = max(0, tot1 - sum(base))
+    allocs = [alloc_power(base, new_total, n1, a) for a in FLAT_ALPHAS]
+    med_e = {}
+    for i in range(n_tr):
+        med_e[i] = int(median([al[i] for al in allocs]))
     rows = []
     for i, tr in enumerate(trophies):
-        if i in intro:
-            rows.append({"id": tr["id"],
-                         "q": [99.9, 99.97, 99.99, 100.0, 100.0]})
-            continue
         e1 = med_e.get(i, base[i])
         med_rate = e1 * 100.0 / n1 if n1 > 0 else base[i]
         lg = logit(med_rate)
@@ -464,11 +497,12 @@ def forecast_rich(case, states):
             spread = math.sqrt(resid_sd ** 2 + 0.015 + timing ** 2
                                + shape ** 2 + 0.005 * days_ahead)
             spread = min(0.85, max(0.10, spread))
-        # A trophy everyone already holds stays ~100%.
+        # A trophy everyone already holds does NOT stay ~100%: the practice
+        # evidence is that a refresh dilutes even a 100% trophy well below
+        # 99.9%, so cap the centre at 99.5% and keep a wide lower tail.
         if obs and all(o[1] >= logit(99.99) for o in obs):
-            rows.append({"id": tr["id"],
-                         "q": [99.9, 99.97, 99.99, 100.0, 100.0]})
-            continue
+            med_rate = min(med_rate, 99.5)
+            spread = max(spread, 0.6)
         lg = logit(med_rate)
         qs = []
         for z in Z:
